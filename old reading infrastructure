@@ -1,0 +1,113 @@
+# wonderful if you want to use whatever calendar this is. i want oca so it doesnt work for me,, BUT! if you figure this out glhf
+
+import discord
+from discord.ext import tasks
+from datetime import datetime
+import pytz
+import os
+import requests
+
+# Getting channel ID and Role ID from environment variables
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+ROLE_ID = int(os.getenv("ROLE_ID"))  # The ID of the 'daily readings' role
+
+# Function to fetch daily readings from Katameros API
+def fetch_daily_readings():
+    base_url = "https://api.katameros.app/readings/gregorian/"
+
+    today = datetime.now().strftime("%d-%m-%Y")
+    url = f"{base_url}{today}?languageId=2"  # Use languageId=2 for English
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()  # Check for HTTP errors
+        data = response.json()
+
+        epistle_reading = "No Epistle reading found for today."
+        gospel_reading = "No Gospel reading found for today."
+
+        sections = data.get("sections", [])
+        for section in sections:
+            for subSection in section.get("subSections", []):
+                # Extract Epistle
+                if subSection.get("title") in ["Pauline Epistle", "Catholic Epistle"]:
+                    for reading in subSection.get("readings", []):
+                        epistle_passages = reading.get("passages", [])
+                        if epistle_passages:
+                            book = epistle_passages[0].get('bookTranslation', 'Unknown Book')
+                            chapter = epistle_passages[0].get('chapter', 'Unknown Chapter')
+                            verse_start = epistle_passages[0]['verses'][0].get('number', 'Unknown Verse')
+                            verse_end = epistle_passages[-1]['verses'][-1].get('number', 'Unknown Verse')
+                            verses = [verse.get('text', 'No Text') for p in epistle_passages for verse in p.get('verses', [])]
+                            combined_verses = " ".join(verses)
+
+                            epistle_reading = f"\n\n# Today's Epistle Reading!\n**{book} {chapter} {verse_start}-{verse_end}**\n\n> {combined_verses}"
+
+                # Extract Gospel
+                if subSection.get("title") == "Psalm & Gospel":
+                    for reading in subSection.get("readings", []):
+                        gospel_passages = reading.get("passages", [])
+                        if gospel_passages:
+                            book = gospel_passages[0].get('bookTranslation', 'Unknown Book')
+                            chapter = gospel_passages[0].get('chapter', 'Unknown Chapter')
+                            verse_start = gospel_passages[0]['verses'][0].get('number', 'Unknown Verse')
+                            verse_end = gospel_passages[-1]['verses'][-1].get('number', 'Unknown Verse')
+                            verses = [verse.get('text', 'No Text') for p in gospel_passages for verse in p.get('verses', [])]
+                            combined_verses = " ".join(verses)
+
+                            gospel_reading = f"\n\n# Today's Gospel Reading!\n**{book} {chapter} {verse_start}-{verse_end}**\n\n> {combined_verses}"
+
+        return epistle_reading, gospel_reading
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching readings: {e}")
+        return None, None
+
+# Task scheduler for daily readings
+@tasks.loop(minutes=1)
+async def schedule_daily_readings():
+    tz = pytz.timezone('America/Los_Angeles')
+    current_time = datetime.now(tz)
+
+    if current_time.hour == 6 and current_time.minute == 30:
+        channel = discord.utils.get(discord.Client().get_all_channels(), id=CHANNEL_ID)
+        if channel:
+            epistle, gospel = fetch_daily_readings()
+
+            if epistle and gospel:
+                # Message 1: Send the daily readings role ping
+                await channel.send(f"|| <@&{ROLE_ID}> ||")
+
+                # Message 2: Send Epistle reading
+                await channel.send(epistle)
+
+                # Message 3: Send Gospel reading
+                await channel.send(gospel)
+            else:
+                await channel.send("Sorry, I couldn't fetch today's readings.")
+
+@schedule_daily_readings.before_loop
+async def before_schedule():
+    await discord.Client().wait_until_ready()
+
+# Function for the test command to send a reading message manually
+async def readings_test(ctx):
+    channel = discord.utils.get(ctx.bot.get_all_channels(), id=CHANNEL_ID)
+    if channel:
+        epistle, gospel = fetch_daily_readings()
+
+        if epistle and gospel:
+            # Message 1: Send the daily readings role ping
+            await channel.send(f"|| <@&{ROLE_ID}> ||")
+
+            # Message 2: Send Epistle reading
+            await channel.send(epistle)
+
+            # Message 3: Send Gospel reading
+            await channel.send(gospel)
+        else:
+            await channel.send("Sorry, I couldn't fetch today's readings.")
