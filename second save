@@ -1,0 +1,491 @@
+# bot.py
+
+import os
+import sys
+import discord
+import openai  # GooseAI follows OpenAI's API structure
+import asyncio
+import threading
+import pygame
+import time
+import datetime
+import pickle
+import logging
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
+# ----------------------
+# Configuration & Flags
+# ----------------------
+# Toggle test mode on/off (True = run tests, False = run normally)
+TEST_MODE = False
+
+# Toggle display functionality on/off (True = enable display, False = disable it)
+DISPLAY_ENABLED = False  # Set to False if you don't want display features (e.g., when you're away from home)
+
+# Toggle whitelist functionality on/off (True = only allow whitelisted users, False = allow anyone)
+WHITELIST_ENABLED = False  # Set to True to restrict access to whitelisted users
+
+# Environment variables for keys (set these in your Replit secrets)
+GOOSEAI_API_KEY = os.getenv("GOOSEAI_API_KEY")
+openai.api_key = GOOSEAI_API_KEY
+openai.api_base = "https://api.goose.ai/v1"
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+if not GOOSEAI_API_KEY:
+    print("ERROR: Please set GOOSEAI_API_KEY in your environment (or Replit secrets).")
+    exit(1)
+    print(
+        "ERROR: Please set DEEPSEEK_API_KEY in your environment (or Replit secrets)."
+    )
+    exit(1)
+if not DISCORD_TOKEN:
+    print(
+        "ERROR: Please set DISCORD_TOKEN in your environment (or Replit secrets)."
+    )
+    exit(1)
+
+
+# Whitelist: Only allow these user IDs to interact with the bot (if whitelist is enabled).
+# Replace the number below with your actual Discord user ID.
+OWNER_ID = 123456789012345678  # <-- Replace with your Discord user ID
+ALLOWED_USER_IDS = {OWNER_ID}
+
+# Default GooseAI Persona (system prompt)
+CHATGPT_PERSONA = "You are a helpful AI assistant. Keep responses clear and direct."
+
+# ----------------------
+# Logging Configuration
+# ----------------------
+logging.basicConfig(level=logging.DEBUG,
+                    format="%(asctime)s [%(levelname)s] %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S")
+logging.info("Starting bot script...")
+
+# ----------------------
+# Pygame Display Section (if enabled)
+# ----------------------
+if DISPLAY_ENABLED:
+    display_state = "idle"  # One of "idle", "processing", "alert", "shutdown", etc.
+    custom_image = None  # Holds a pygame Surface if a custom image is set.
+    display_state_lock = threading.Lock()
+
+    def set_display_state(state):
+        global display_state
+        with display_state_lock:
+            display_state = state
+        logging.debug(f"Display state set to: {state}")
+
+    def get_display_state():
+        with display_state_lock:
+            return display_state
+
+    def set_custom_image(img):
+        global custom_image
+        with display_state_lock:
+            custom_image = img
+        logging.debug("Custom display image set.")
+
+    def clear_custom_image():
+        global custom_image
+        with display_state_lock:
+            custom_image = None
+        logging.debug("Custom display image cleared.")
+
+    def get_custom_image():
+        with display_state_lock:
+            return custom_image
+
+    def run_display():
+        logging.info("Starting Pygame display thread.")
+        pygame.init()
+        screen = pygame.display.set_mode((640, 480))
+        pygame.display.set_caption("Discord Bot Display")
+
+        # Load default images (ensure these PNGs are in your working directory)
+        try:
+            idle_img = pygame.image.load("idle.png")
+            processing_img = pygame.image.load("processing.png")
+            alert_img = pygame.image.load("alert.png")
+            shutdown_img = pygame.image.load("shutdown.png")
+            logging.info("Default images loaded successfully.")
+        except Exception as e:
+            logging.error("Error loading default images: " + str(e))
+            return
+
+        # Dictionary mapping display states to images.
+        images = {
+            "idle": idle_img,
+            "processing": processing_img,
+            "alert": alert_img,
+            "shutdown": shutdown_img
+        }
+
+        clock = pygame.time.Clock()
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    logging.info("Pygame quit event received.")
+                    pygame.quit()
+                    return
+
+            # Check for custom image override first.
+            current_custom = get_custom_image()
+            if current_custom is not None:
+                current_img = current_custom
+            else:
+                state = get_display_state()
+                current_img = images.get(state, idle_img)
+
+            screen.blit(current_img, (0, 0))
+            pygame.display.flip()
+            clock.tick(10)  # 10 frames per second
+
+    # Start the display thread (runs in the background)
+    display_thread = threading.Thread(target=run_display, daemon=True)
+    display_thread.start()
+else:
+    logging.info("Display is disabled. Skipping Pygame initialization.")
+
+# ----------------------
+# Google Tasks Integration
+# ----------------------
+SCOPES = ['https://www.googleapis.com/auth/tasks']
+creds = None
+
+
+def get_google_tasks_service():
+    global creds
+    logging.debug("Attempting to get Google Tasks service...")
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+        logging.debug("Loaded credentials from token.pickle.")
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            logging.debug("Credentials refreshed.")
+        else:
+            logging.info("No valid credentials, initiating login flow.")
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+        logging.debug("Saved new credentials to token.pickle.")
+    service = build('tasks', 'v1', credentials=creds)
+    logging.debug("Google Tasks service built successfully.")
+    return service
+
+
+def add_google_task(task_title, due=None):
+    logging.debug(f"Adding Google Task: {task_title} with due: {due}")
+    service = get_google_tasks_service()
+    task = {'title': task_title}
+    if due:
+        task['due'] = due.isoformat() + 'Z'
+    result = service.tasks().insert(tasklist='@default', body=task).execute()
+    logging.info(f"Task added: {result.get('title', 'Untitled')}")
+    return result
+
+
+def list_google_tasks():
+    logging.debug("Listing Google Tasks...")
+    service = get_google_tasks_service()
+    result = service.tasks().list(tasklist='@default').execute()
+    tasks = result.get('items', [])
+    if not tasks:
+        return "No tasks found."
+    output = "Tasks:\n"
+    for task in tasks:
+        output += f"- {task.get('title', 'Untitled')}\n"
+    logging.info("Tasks listed successfully.")
+    return output
+
+
+def remove_google_task(task_title):
+    logging.debug(f"Removing Google Task: {task_title}")
+    service = get_google_tasks_service()
+    result = service.tasks().list(tasklist='@default').execute()
+    tasks = result.get('items', [])
+    for task in tasks:
+        if task.get('title', '').lower() == task_title.lower():
+            service.tasks().delete(tasklist='@default',
+                                   task=task['id']).execute()
+            logging.info(f"Task removed: {task_title}")
+            return f"Removed task: {task_title}"
+    logging.warning(f"Task '{task_title}' not found.")
+    return f"Task '{task_title}' not found."
+
+
+# ----------------------
+# GooseAI Integration
+# ----------------------
+async def get_gooseai_response(prompt, user_id):
+    MAX_TOKENS = 1000  # Increased token limit for context
+    MAX_HISTORY = 5  # Keep last 5 exchanges
+    
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    
+    history = conversation_history[user_id]
+    
+    logging.debug(f"Generating GooseAI response for prompt: {prompt}")
+    if DISPLAY_ENABLED:
+        set_display_state("processing")
+    
+    # Build context from history
+    context = f"Instructions: {CHATGPT_PERSONA}\n"
+    for h in history[-MAX_HISTORY:]:
+        context += f"Previous Q: {h['q']}\nPrevious A: {h['a']}\n"
+    context += f"Q: {prompt}\nA:"
+    
+    try:
+        response = await asyncio.to_thread(
+            openai.Completion.create,
+            engine="gpt-neo-20b",
+            prompt=context,
+            max_tokens=MAX_TOKENS,
+            temperature=0.7,
+            top_p=0.9,
+            stop=None,
+            presence_penalty=0.3,
+            frequency_penalty=0.3
+        )
+        answer = response.choices[0].text.strip()
+        logging.debug("GooseAI response received.")
+    except Exception as e:
+        answer = f"Error with GooseAI: {e}"
+        logging.error("GooseAI error: " + str(e))
+    if DISPLAY_ENABLED:
+        set_display_state("idle")
+    return answer
+
+
+# ----------------------
+# Timer Command Handler
+# ----------------------
+async def handle_timer(delay, timer_message, orig_message):
+    logging.info(
+        f"Timer set for {delay} seconds with message: {timer_message}")
+    await asyncio.sleep(delay)
+    await orig_message.channel.send(f"⏰ Timer Alert: {timer_message}")
+    logging.info("Timer alert sent.")
+
+
+# ----------------------
+# Display Command Reset Handler
+# ----------------------
+async def reset_display_after_delay(delay, orig_message):
+    logging.info(f"Display will reset after {delay} seconds.")
+    await asyncio.sleep(delay)
+    if DISPLAY_ENABLED:
+        clear_custom_image()
+    await orig_message.channel.send("Display reset to normal.")
+    logging.info("Display reset notification sent.")
+
+
+# ----------------------
+# Discord Bot Setup
+# ----------------------
+intents = discord.Intents.default()
+intents.message_content = True
+
+client = discord.Client(intents=intents)
+
+# Store conversation history per user
+conversation_history = {}
+
+
+@client.event
+async def on_ready():
+    logging.info(f"Logged in as {client.user}")
+    if DISPLAY_ENABLED:
+        set_display_state("idle")
+
+
+@client.event
+async def on_message(message):
+    # Skip messages from the bot itself.
+    if message.author == client.user:
+        return
+
+    # DM-Only: Process only direct messages.
+    if message.guild is not None:
+        logging.debug("Message received in a guild; ignoring (DM-only mode).")
+        return
+
+    # If whitelist is enabled, restrict access.
+    if WHITELIST_ENABLED and message.author.id not in ALLOWED_USER_IDS:
+        logging.warning(
+            f"Unauthorized access attempt from user: {message.author.id}")
+        return
+
+    content = message.content.strip()
+    logging.debug(f"Received message from {message.author.id}: {content}")
+
+    # Process commands that start with "!"
+    if content.startswith("!"):
+        parts = content.split(maxsplit=1)
+        command = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
+        logging.debug(f"Command detected: {command} with arg: {arg}")
+
+        if command == "!addtask":
+            if not arg:
+                await message.channel.send("Usage: !addtask [task description]"
+                                           )
+                return
+            result = await asyncio.to_thread(add_google_task, arg)
+            await message.channel.send(
+                f"Added task: {result.get('title', 'Untitled')}")
+
+        elif command == "!tasks":
+            tasks_str = await asyncio.to_thread(list_google_tasks)
+            await message.channel.send(tasks_str)
+
+        elif command == "!removetask":
+            if not arg:
+                await message.channel.send(
+                    "Usage: !removetask [task description]")
+                return
+            result = await asyncio.to_thread(remove_google_task, arg)
+            await message.channel.send(result)
+
+        elif command == "!timer":
+            if not arg:
+                await message.channel.send("Usage: !timer <duration> <message>"
+                                           )
+                return
+            timer_parts = arg.split()
+            if len(timer_parts) < 3:
+                await message.channel.send("Usage: !timer <duration> <message>"
+                                           )
+                return
+            try:
+                duration_val = float(timer_parts[0])
+                duration_unit = timer_parts[1].lower()
+                if duration_unit.startswith("sec"):
+                    delay = duration_val
+                elif duration_unit.startswith("min"):
+                    delay = duration_val * 60
+                elif duration_unit.startswith("hour"):
+                    delay = duration_val * 3600
+                else:
+                    await message.channel.send(
+                        "Unknown time unit. Use seconds, minutes, or hours.")
+                    return
+            except Exception as e:
+                await message.channel.send("Error parsing duration: " + str(e))
+                return
+            timer_message = " ".join(timer_parts[2:])
+            asyncio.create_task(handle_timer(delay, timer_message, message))
+            await message.channel.send(
+                f"Timer set for {timer_parts[0]} {timer_parts[1]}.")
+
+        elif command == "!setpersona":
+            if not arg:
+                await message.channel.send("Usage: !setpersona [persona text]")
+                return
+            global CHATGPT_PERSONA
+            CHATGPT_PERSONA = arg
+            await message.channel.send("GooseAI persona updated.")
+            logging.info("GooseAI persona updated.")
+
+        elif command == "!display":
+            if not DISPLAY_ENABLED:
+                await message.channel.send("Display functionality is disabled."
+                                           )
+                logging.info(
+                    "Display command ignored because display is disabled.")
+                return
+            if not arg:
+                await message.channel.send("Usage: !display [filename]")
+                return
+            if not os.path.isfile(arg):
+                await message.channel.send(
+                    f"File '{arg}' not found in the directory.")
+                logging.error(f"Display command: File '{arg}' not found.")
+                return
+            try:
+                custom_img = pygame.image.load(arg)
+            except Exception as e:
+                await message.channel.send(f"Error loading image '{arg}': {e}")
+                logging.error(f"Error loading image '{arg}': {e}")
+                return
+            set_custom_image(custom_img)
+            await message.channel.send(f"Displaying '{arg}' for 5 minutes.")
+            logging.info(
+                f"Custom image '{arg}' is now displayed for 5 minutes.")
+            asyncio.create_task(reset_display_after_delay(300, message))
+
+        else:
+            await message.channel.send("Unknown command.")
+            logging.debug("Unknown command received.")
+    else:
+        # Default: treat any non-command DM as a GooseAI prompt.
+        logging.debug(
+            "Non-command message received; processing as GooseAI prompt.")
+        response = await get_gooseai_response(content, message.author.id)
+        
+        # Store the exchange in history
+        if message.author.id not in conversation_history:
+            conversation_history[message.author.id] = []
+        conversation_history[message.author.id].append({
+            'q': content,
+            'a': response
+        })
+        
+        await message.channel.send(response)
+
+
+# ----------------------
+# Main Entry Point
+# ----------------------
+if TEST_MODE:
+    logging.info("Running in test mode (TEST_MODE is enabled).")
+
+    async def run_tests():
+        # Test GooseAI integration.
+        logging.info("Testing GooseAI integration...")
+        response = await get_chatgpt_response("Test prompt for GooseAI.")
+        logging.info("GooseAI test response: " + response)
+
+        # Test timer: create a dummy message and channel.
+        class DummyChannel:
+
+            async def send(self, msg):
+                logging.info("DummyChannel.send: " + msg)
+
+        class DummyMessage:
+            channel = DummyChannel()
+
+        dummy_message = DummyMessage()
+        logging.info("Scheduling a 5-second timer test.")
+        asyncio.create_task(
+            handle_timer(5, "This is a test timer alert.", dummy_message))
+
+        # Test display command if enabled.
+        if DISPLAY_ENABLED:
+            test_image = "idle.png"
+            if os.path.isfile(test_image):
+                try:
+                    custom_img = pygame.image.load(test_image)
+                    set_custom_image(custom_img)
+                    logging.info("Test: Custom image loaded successfully.")
+                    asyncio.create_task(
+                        reset_display_after_delay(10, dummy_message))
+                except Exception as e:
+                    logging.error("Test: Error loading image: " + str(e))
+            else:
+                logging.warning("Test image 'idle.png' not found.")
+
+        # Let the tests run a little while.
+        await asyncio.sleep(12)
+        logging.info("Test mode completed.")
+
+    asyncio.run(run_tests())
+else:
+    logging.info("Starting Discord Bot normally.")
+    client.run(DISCORD_TOKEN)
